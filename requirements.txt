@@ -1,0 +1,12 @@
+anthropic
+beautifulsoup4
+google-api-python-client
+google-auth
+google-auth-oauthlib
+gspread
+httpx
+pandas
+pytest
+python-dotenv
+streamlit
+tldextract
