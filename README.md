@@ -5,6 +5,8 @@ foley and post-production programs. For each school it finds the people to conta
 Limiter education partnership and records the school's size and tuition. Results go to a Google
 Sheet, and you can email contacts from your Gmail (javon@naturl.audio) using templates.
 
+New here? Start with **[GETTING_STARTED.md](GETTING_STARTED.md)**.
+
 ## How it works
 
 1. **Search**: general keywords run once per region (e.g. "foley course university Germany").
