@@ -1,9 +1,11 @@
 """Templated outreach emails through Gmail (drafts by default, or send)."""
 import base64
 from collections import defaultdict
+from datetime import datetime, timezone
 from email.message import EmailMessage
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from . import config, db
 from .google_auth import get_credentials
@@ -91,3 +93,52 @@ def send(conn, contact, subject, body):
     sent = _service().users().messages().send(userId="me", body={"raw": raw}).execute()
     db.record_outreach(conn, contact["id"], "sent", sent["id"], subject)
     return sent["id"]
+
+
+# --- tracking (needs the gmail.readonly permission) ----------------------------
+
+def _search(svc, query):
+    return svc.users().messages().list(userId="me", q=query, maxResults=10).execute().get("messages", [])
+
+
+def _newest_time(svc, messages):
+    times = [int(svc.users().messages().get(userId="me", id=m["id"], format="minimal").execute()["internalDate"])
+             for m in messages]
+    return datetime.fromtimestamp(max(times) / 1000, timezone.utc).isoformat(timespec="seconds")
+
+
+def check_gmail(conn, log=print):
+    """Update contacts whose draft/email is pending. Returns [(contact_id, new_status)]."""
+    svc = _service()
+    changes = []
+    for row in db.pending_outreach(conn):
+        cid, email, domain = row["contact_id"], row["email"], row["domain"]
+        since = int(datetime.fromisoformat(row["created_at"]).timestamp()) - 60
+
+        if row["outreach_status"] == "Draft created":
+            try:
+                svc.users().drafts().get(userId="me", id=row["gmail_id"], format="minimal").execute()
+                continue  # still sitting in Drafts
+            except HttpError as e:
+                if e.resp.status != 404:
+                    raise
+            if _search(svc, f"in:sent to:{email} after:{since}"):
+                db.set_outreach_status(conn, cid, "Email sent")
+                changes.append((cid, "Email sent"))
+            else:
+                db.set_outreach_status(conn, cid, "Draft deleted")
+                changes.append((cid, "Draft deleted"))
+                continue
+
+        if _search(svc, f'from:(mailer-daemon OR postmaster) "{email}" after:{since}'):
+            db.set_outreach_status(conn, cid, "Bounced")
+            changes.append((cid, "Bounced"))
+            continue
+        # A reply from the contact, or from anyone else at the school (e.g. they forwarded it).
+        replies = _search(svc, f"from:({email} OR {domain}) after:{since} -in:sent")
+        if replies:
+            db.set_outreach_status(conn, cid, "Replied", reply_at=_newest_time(svc, replies))
+            changes.append((cid, "Replied"))
+    for cid, status in changes:
+        log(f"{db.get_contact(conn, cid)['email']}: {status}")
+    return changes

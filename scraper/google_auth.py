@@ -11,7 +11,8 @@ from . import config
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",   # lets the tool create its own spreadsheet
-    "https://www.googleapis.com/auth/gmail.compose",  # create drafts and send mail (no inbox reading)
+    "https://www.googleapis.com/auth/gmail.compose",   # create drafts and send mail
+    "https://www.googleapis.com/auth/gmail.readonly",  # detect replies, bounces and drafts you sent
 ]
 
 
@@ -26,7 +27,9 @@ def is_connected():
 def get_credentials(interactive=True):
     creds = None
     if config.GOOGLE_TOKEN.exists():
-        creds = Credentials.from_authorized_user_file(str(config.GOOGLE_TOKEN), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(config.GOOGLE_TOKEN))
+        if not creds.has_scopes(SCOPES):  # signed in before new permissions were added
+            creds = None
     if creds and creds.valid:
         return creds
     if creds and creds.expired and creds.refresh_token:

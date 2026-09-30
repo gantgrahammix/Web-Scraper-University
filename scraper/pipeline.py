@@ -4,6 +4,7 @@ from .crawler import Crawler
 from .domains import is_blocked, looks_academic, registered_domain
 from .enrich import enrich
 from .extract import AUDIO_TERMS, extract
+from .prefilter import screen
 from .search import search
 
 MAX_ATTEMPTS = 3  # per domain, across errors and re-checks
@@ -26,31 +27,48 @@ def should_process(status, hit):
     return hit["url"] != status["last_url"] and audio_score(hit) >= 1
 
 
-def build_queries(keywords, regions):
+def build_queries(keywords, regions, regional=None):
+    """Return [{"query", "region"}].
+    keywords: searched in every region as "<keyword> university <region>".
+    regional: {region: [keyword, ...]} country-specific (often local-language) phrases,
+              searched as written and only for that region."""
+    regional = regional or {}
     queries = []
-    for k in keywords:
-        if regions:
-            queries.extend(f"{k} university {r}" for r in regions)
-        else:
-            queries.append(f"{k} university")
+    for r in regions or [""]:
+        for k in keywords:
+            queries.append({"query": f"{k} university {r}".strip(), "region": r})
+        for k in regional.get(r, []):
+            queries.append({"query": k, "region": r})
     return queries
 
 
-def run(conn, keywords, regions, max_new=25, force=False, log=print):
-    """Process search results until `max_new` new schools have been saved.
-    Returns a summary dict."""
+def queries_from_db(conn, regions, keyword_ids=None):
+    """Build queries from the active keywords in the database (optionally only the given ids)."""
+    rows = [k for k in db.list_keywords(conn, active_only=True) if keyword_ids is None or k["id"] in keyword_ids]
+    global_kw = [k["keyword"] for k in rows if not k["region"]]
+    regional = {}
+    for k in rows:
+        if k["region"]:
+            regional.setdefault(k["region"], []).append(k["keyword"])
+    return build_queries(global_kw, regions, regional)
+
+
+def run(conn, queries, max_new=25, force=False, log=print):
+    """Process search results for `queries` (from build_queries / queries_from_db) until
+    `max_new` new schools have been saved. Returns a summary dict."""
     summary = {"queries": 0, "skipped_queries": 0, "saved": 0, "not_relevant": 0,
-               "already_known": 0, "errors": 0, "saved_domains": []}
+               "already_known": 0, "prefiltered": 0, "errors": 0, "saved_domains": []}
     crawler = Crawler()
     try:
-        for query in build_queries(keywords, regions):
+        for q in queries:
+            query = q["query"]
             if summary["saved"] >= max_new:
                 break
             if not force and db.query_already_run(conn, query):
                 summary["skipped_queries"] += 1
                 continue
             log(f"Searching: {query}")
-            results = search(query)
+            results = search(query, country=q["region"])
             summary["queries"] += 1
 
             # One entry per domain (its most audio-related hit), academic domains first.
@@ -61,17 +79,24 @@ def run(conn, keywords, regions, max_new=25, force=False, log=print):
                     by_domain[d] = r
             ordered = sorted(by_domain.items(), key=lambda kv: not looks_academic(kv[0]))
 
-            finished = True
+            candidates = []
             for domain, hit in ordered:
+                if not should_process(db.domain_status(conn, domain), hit):
+                    summary["already_known"] += 1
+                elif is_blocked(domain):
+                    db.mark_domain_seen(conn, domain, "blocked", "aggregator/social/marketplace", hit["url"])
+                else:
+                    candidates.append((domain, hit))
+            candidates, skipped = screen(candidates, log)
+            summary["prefiltered"] += len(skipped)
+            if skipped:
+                log(f"  Prefilter skipped {len(skipped)}: " + ", ".join(d for d, _ in skipped))
+
+            finished = True
+            for domain, hit in candidates:
                 if summary["saved"] >= max_new:
                     finished = False  # leave the query unrecorded so the next run resumes it
                     break
-                if not should_process(db.domain_status(conn, domain), hit):
-                    summary["already_known"] += 1
-                    continue
-                if is_blocked(domain):
-                    db.mark_domain_seen(conn, domain, "blocked", "aggregator/social/marketplace", hit["url"])
-                    continue
                 _process(conn, crawler, domain, hit, query, summary, log)
             if finished:
                 db.record_query(conn, query, len(results))

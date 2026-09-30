@@ -2,21 +2,25 @@
 import argparse
 import sys
 
-from scraper import config, db, pipeline, sheets
+from scraper import config, db, outreach, pipeline, sheets, suggest
 from scraper.google_auth import get_credentials
 
 
 def cmd_run(conn, args):
-    keywords = args.keyword or [k["keyword"] for k in db.list_keywords(conn, active_only=True)]
     if args.regions == "none":
         regions = []
     elif args.regions:
         regions = [r.strip() for r in args.regions.split(",") if r.strip()]
     else:
         regions = [r["region"] for r in db.list_regions(conn, active_only=True)]
-    summary = pipeline.run(conn, keywords, regions, max_new=args.limit, force=args.force)
+    if args.keyword:
+        queries = pipeline.build_queries(args.keyword, regions)
+    else:
+        queries = pipeline.queries_from_db(conn, regions)
+    summary = pipeline.run(conn, queries, max_new=args.limit, force=args.force)
     print(f"\nSaved {summary['saved']} new schools; {summary['not_relevant']} not relevant; "
-          f"{summary['already_known']} already known; {summary['errors']} errors; "
+          f"{summary['already_known']} already known; {summary['prefiltered']} skipped by prefilter; "
+          f"{summary['errors']} errors; "
           f"{summary['queries']} searches run, {summary['skipped_queries']} skipped (already run).")
     if not args.no_sync and summary["saved"] and config.GOOGLE_TOKEN.exists():
         n_i, n_c = sheets.sync(conn)
@@ -24,15 +28,32 @@ def cmd_run(conn, args):
 
 
 def cmd_keywords(conn, args):
+    region = args.region or ""
+    if args.suggest:
+        if not region:
+            raise SystemExit("--suggest needs --region, e.g. --region Germany")
+        suggestions = suggest.suggest_keywords(conn, region, count=args.count)
+        for i, s in enumerate(suggestions, 1):
+            print(f"  {i:2}. {s['keyword']}  [{s['language']}] = {s['english_meaning']}\n      {s['why']}")
+        if args.accept:
+            picks = suggestions if args.accept == "all" else [suggestions[int(n) - 1] for n in args.accept.split(",")]
+            print(f"Added {suggest.add_suggestions(conn, region, picks)} keywords for {region}.")
+        else:
+            print("\nRe-run with --accept all (or --accept 1,3,5) to add them.")
+        return
     if args.add:
         for k in args.add:
-            print(("added: " if db.add_keyword(conn, k) else "already exists: ") + k)
+            print(("added: " if db.add_keyword(conn, k, region=region) else "already exists: ") + k)
     if args.remove:
         for k in args.remove:
-            db.delete_keyword(conn, k)
-            print("removed: " + k)
-    for k in db.list_keywords(conn):
-        print(("  [on]  " if k["active"] else "  [off] ") + k["keyword"])
+            kid = db.find_keyword_id(conn, k, region)
+            if kid:
+                db.delete_keyword(conn, kid)
+                print("removed: " + k)
+    for k in db.list_keywords(conn, region=region if args.region else None):
+        where = f" ({k['region']})" if k["region"] else ""
+        note = f"  = {k['note']}" if k["note"] else ""
+        print(("  [on]  " if k["active"] else "  [off] ") + k["keyword"] + where + note)
 
 
 def cmd_regions(conn, args):
@@ -48,6 +69,16 @@ def cmd_sync(conn, args):
     print(f"Added {n_i} schools and {n_c} contacts. {sheets.sheet_url()}")
     if args.pull:
         print(f"Pulled Status/Notes for {sheets.pull_status(conn)} rows from the sheet.")
+
+
+def cmd_check_gmail(conn, args):
+    changes = outreach.check_gmail(conn)
+    print(f"{len(changes)} contacts updated.")
+    if config.GOOGLE_SHEET_ID:
+        for cid, _ in changes:
+            contact = db.get_contact(conn, cid)
+            if contact["synced"]:
+                sheets.mark_outreach(contact)
 
 
 def cmd_google_login(conn, args):
@@ -76,9 +107,13 @@ def main(argv=None):
     r.add_argument("--force", action="store_true", help="re-run searches that were already run")
     r.add_argument("--no-sync", action="store_true", help="don't push results to Google Sheets")
 
-    k = sub.add_parser("keywords", help="list/add/remove keywords")
+    k = sub.add_parser("keywords", help="list/add/remove keywords, or get suggestions for a country")
+    k.add_argument("--region", help="work with keywords for one country (default: keywords used everywhere)")
     k.add_argument("--add", nargs="+")
     k.add_argument("--remove", nargs="+")
+    k.add_argument("--suggest", action="store_true", help="ask Claude for search phrases for --region")
+    k.add_argument("--count", type=int, default=12)
+    k.add_argument("--accept", help="with --suggest: 'all' or numbers like 1,3,5")
 
     rg = sub.add_parser("regions", help="list/add regions")
     rg.add_argument("--add", nargs="+")
@@ -86,13 +121,15 @@ def main(argv=None):
     s = sub.add_parser("sync", help="push new rows to Google Sheets")
     s.add_argument("--pull", action="store_true", help="also pull Status/Notes edits back from the sheet")
 
+    sub.add_parser("check-gmail", help="detect replies, bounces and drafts you've sent")
     sub.add_parser("google-login", help="connect your Google account (Sheets + Gmail)")
     sub.add_parser("stats", help="show totals")
 
     args = p.parse_args(argv)
     conn = db.connect()
     handler = {"run": cmd_run, "keywords": cmd_keywords, "regions": cmd_regions, "sync": cmd_sync,
-               "google-login": cmd_google_login, "stats": cmd_stats}[args.cmd]
+               "google-login": cmd_google_login, "stats": cmd_stats,
+               "check-gmail": cmd_check_gmail}[args.cmd]
     try:
         handler(conn, args)
     except Exception as e:

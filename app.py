@@ -2,7 +2,7 @@
 import pandas as pd
 import streamlit as st
 
-from scraper import config, db, outreach, pipeline, sheets
+from scraper import config, db, llm, outreach, pipeline, sheets, suggest
 from scraper.google_auth import GoogleAuthError, disconnect, get_credentials, is_connected
 
 st.set_page_config(page_title="Naturl Audio - University Finder", layout="wide")
@@ -50,17 +50,19 @@ tab_search, tab_schools, tab_outreach, tab_keywords, tab_templates, tab_history 
 # --- search ---------------------------------------------------------------------
 with tab_search:
     st.subheader("Find new schools")
-    active_kw = [k["keyword"] for k in db.list_keywords(conn, active_only=True)]
+    all_kw = db.list_keywords(conn)
+    kw_label = {k["id"]: k["keyword"] + (f"  ·  {k['region']} only" if k["region"] else "") for k in all_kw}
     active_rg = [r["region"] for r in db.list_regions(conn, active_only=True)]
-    kws = st.multiselect("Keywords", [k["keyword"] for k in db.list_keywords(conn)], default=active_kw)
-    rgs = st.multiselect("Regions (each keyword is searched once per region)",
+    kws = st.multiselect("Keywords", list(kw_label), format_func=kw_label.get,
+                         default=[k["id"] for k in all_kw if k["active"]])
+    rgs = st.multiselect("Regions (general keywords are searched once per region; country-specific ones only in their country)",
                          [r["region"] for r in db.list_regions(conn)], default=active_rg)
     c1, c2, c3 = st.columns(3)
     max_new = c1.number_input("Stop after this many new schools", 1, 500, 10)
     force = c2.checkbox("Re-run searches already done", help="Schools already found are still skipped.")
     auto_sync = c3.checkbox("Push results to Google Sheet", value=is_connected(), disabled=not is_connected())
-    queries = pipeline.build_queries(kws, rgs)
-    pending = [q for q in queries if force or not db.query_already_run(conn, q)]
+    queries = pipeline.queries_from_db(conn, rgs, keyword_ids=set(kws))
+    pending = [q for q in queries if force or not db.query_already_run(conn, q["query"])]
     st.caption(f"{len(queries)} searches, {len(pending)} not run yet.")
 
     if st.button("Start search", type="primary", disabled=not (kws and config.BRAVE_API_KEY)):
@@ -73,13 +75,14 @@ with tab_search:
 
         with st.spinner("Searching and reading school websites…"):
             try:
-                summary = pipeline.run(conn, kws, rgs, max_new=int(max_new), force=force, log=log)
+                summary = pipeline.run(conn, queries, max_new=int(max_new), force=force, log=log)
             except Exception as e:
                 st.error(f"Search stopped: {e}")
                 summary = None
         if summary:
             st.success(f"Saved {summary['saved']} new schools · {summary['not_relevant']} not relevant · "
-                       f"{summary['already_known']} already known · {summary['errors']} errors")
+                       f"{summary['already_known']} already known · {summary['prefiltered']} skipped by prefilter · "
+                       f"{summary['errors']} errors")
             if auto_sync and summary["saved"]:
                 try:
                     n_i, n_c = sheets.sync(conn)
@@ -126,6 +129,18 @@ with tab_schools:
 
 # --- outreach -------------------------------------------------------------------
 with tab_outreach:
+    if st.button("🔄 Check Gmail for replies, bounces and sent drafts", disabled=not is_connected()):
+        try:
+            with st.spinner("Checking Gmail…"):
+                changes = outreach.check_gmail(conn, log=lambda m: None)
+            for cid, status in changes:
+                contact = db.get_contact(conn, cid)
+                st.write(f"{contact['institution']} — {contact['email']}: **{status}**")
+                if config.GOOGLE_SHEET_ID and contact["synced"]:
+                    sheets.mark_outreach(contact)
+            st.success(f"{len(changes)} contacts updated." if changes else "No changes.")
+        except Exception as e:
+            st.error(str(e))
     contacts = [c for c in db.list_contacts(conn) if c["email"]]
     templates = db.list_templates(conn)
     if not contacts:
@@ -189,34 +204,69 @@ with tab_outreach:
 
 # --- keywords & regions ---------------------------------------------------------
 with tab_keywords:
-    c1, c2 = st.columns(2)
+    regions_all = [r["region"] for r in db.list_regions(conn)]
+    scope = st.selectbox("Show keywords for", ["All regions (general)"] + regions_all,
+                         help="General keywords are searched in every region. Country keywords only in that country.")
+    region = "" if scope.startswith("All regions") else scope
+
+    c1, c2 = st.columns([3, 2])
     with c1:
-        st.subheader("Keywords")
+        st.subheader("Keywords" + (f" for {region}" if region else " (all regions)"))
         with st.form("add_kw", clear_on_submit=True):
             new_kw = st.text_input("Add keyword(s), one per line or comma-separated")
             if st.form_submit_button("Add"):
                 for k in new_kw.replace("\n", ",").split(","):
-                    db.add_keyword(conn, k)
+                    db.add_keyword(conn, k, region=region)
                 st.rerun()
-        for k in db.list_keywords(conn):
-            a, b = st.columns([5, 1])
-            on = a.checkbox(k["keyword"], value=bool(k["active"]), key=f"kw_{k['keyword']}")
+        for k in db.list_keywords(conn, region=region):
+            a, b = st.columns([6, 1])
+            label = k["keyword"] + (f"  —  {k['note']}" if k["note"] else "") + (" ✨" if k["source"] == "suggested" else "")
+            on = a.checkbox(label, value=bool(k["active"]), key=f"kw_{k['id']}")
             if on != bool(k["active"]):
-                db.set_keyword_active(conn, k["keyword"], on)
-            if b.button("🗑", key=f"del_{k['keyword']}"):
-                db.delete_keyword(conn, k["keyword"])
+                db.set_keyword_active(conn, k["id"], on)
+            if b.button("🗑", key=f"del_{k['id']}"):
+                db.delete_keyword(conn, k["id"])
                 st.rerun()
+
     with c2:
-        st.subheader("Regions")
-        with st.form("add_rg", clear_on_submit=True):
-            new_rg = st.text_input("Add region / country")
-            if st.form_submit_button("Add"):
-                db.add_region(conn, new_rg)
-                st.rerun()
-        for r in db.list_regions(conn):
-            on = st.checkbox(r["region"], value=bool(r["active"]), key=f"rg_{r['region']}")
-            if on != bool(r["active"]):
-                db.set_region_active(conn, r["region"], on)
+        st.subheader("✨ Suggest keywords")
+        st.caption("Claude recommends search phrases for a country, in the local language(s), using "
+                   "program names already found there as hints.")
+        sug_region = st.selectbox("Country", regions_all, index=regions_all.index(region) if region in regions_all else 0)
+        n = st.slider("How many", 5, 25, 12)
+        if st.button("Get suggestions", disabled=not llm.available()):
+            with st.spinner(f"Thinking about how people search for audio programs in {sug_region}…"):
+                try:
+                    st.session_state["suggestions"] = (sug_region, suggest.suggest_keywords(conn, sug_region, n))
+                except Exception as e:
+                    st.error(str(e))
+        if not llm.available():
+            st.info("Needs ANTHROPIC_API_KEY in .env.")
+        if "suggestions" in st.session_state:
+            s_region, items = st.session_state["suggestions"]
+            with st.form("accept_suggestions"):
+                st.write(f"Suggestions for **{s_region}**:")
+                picked = [s for i, s in enumerate(items)
+                          if st.checkbox(f"{s['keyword']}  [{s['language']}] — {s['english_meaning']}",
+                                         value=True, key=f"sug_{i}", help=s["why"])]
+                if st.form_submit_button("Add selected"):
+                    added = suggest.add_suggestions(conn, s_region, picked)
+                    del st.session_state["suggestions"]
+                    st.success(f"Added {added} keywords for {s_region}.")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("Regions")
+    with st.form("add_rg", clear_on_submit=True):
+        new_rg = st.text_input("Add region / country")
+        if st.form_submit_button("Add"):
+            db.add_region(conn, new_rg)
+            st.rerun()
+    cols = st.columns(4)
+    for i, r in enumerate(db.list_regions(conn)):
+        on = cols[i % 4].checkbox(r["region"], value=bool(r["active"]), key=f"rg_{r['region']}")
+        if on != bool(r["active"]):
+            db.set_region_active(conn, r["region"], on)
 
 # --- templates ------------------------------------------------------------------
 with tab_templates:

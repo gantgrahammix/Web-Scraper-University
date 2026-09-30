@@ -1,12 +1,9 @@
 """Read crawled pages and pull out institution details and partnership contacts.
 
 Uses Claude when ANTHROPIC_API_KEY is set; otherwise falls back to simple rules."""
-import json
 import re
 
-import anthropic
-
-from . import config
+from . import llm
 
 ROLES = ["partnerships", "program_head", "dean", "department", "admissions", "general"]
 ROLE_PRIORITY = {r: i + 1 for i, r in enumerate(ROLES)}
@@ -90,32 +87,8 @@ def _pages_to_prompt(domain, pages, hit=None):
     return "\n".join(parts)
 
 
-class ExtractionError(RuntimeError):
-    pass
-
-
-def extract_with_claude(domain, pages, hit=None, client=None):
-    client = client or anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY or None)
-    response = client.beta.messages.create(
-        model=config.CLAUDE_MODEL,
-        max_tokens=16000,
-        system=SYSTEM,
-        messages=[{"role": "user", "content": _pages_to_prompt(domain, pages, hit)}],
-        output_config={
-            "effort": config.CLAUDE_EFFORT,
-            "format": {"type": "json_schema", "schema": SCHEMA},
-        },
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-    )
-    if response.stop_reason == "refusal":
-        raise ExtractionError("Claude declined to process this site")
-    if response.stop_reason == "max_tokens":
-        raise ExtractionError("Claude's answer was cut off (max_tokens)")
-    text = next((b.text for b in response.content if b.type == "text"), None)
-    if text is None:
-        raise ExtractionError("Claude returned no text")
-    return json.loads(text)
+def extract_with_claude(domain, pages, hit=None):
+    return llm.ask_json(SYSTEM, _pages_to_prompt(domain, pages, hit), SCHEMA)
 
 
 def validate(data, pages):
@@ -186,7 +159,7 @@ def extract_with_rules(domain, pages, hit=None):
 
 
 def extract(domain, pages, hit=None):
-    if config.ANTHROPIC_API_KEY:
+    if llm.available():
         data = extract_with_claude(domain, pages, hit)
     else:
         data = extract_with_rules(domain, pages, hit)

@@ -95,8 +95,115 @@ def test_render_template():
 
 
 def test_build_queries():
-    assert pipeline.build_queries(["foley"], ["UK", "Japan"]) == ["foley university UK", "foley university Japan"]
-    assert pipeline.build_queries(["foley"], []) == ["foley university"]
+    qs = pipeline.build_queries(["foley"], ["UK", "Japan"], {"Japan": ["音響 専門学校"]})
+    assert qs == [
+        {"query": "foley university UK", "region": "UK"},
+        {"query": "foley university Japan", "region": "Japan"},
+        {"query": "音響 専門学校", "region": "Japan"},
+    ]
+    assert pipeline.build_queries(["foley"], []) == [{"query": "foley university", "region": ""}]
+
+
+def test_regional_keywords_from_db():
+    conn = db.connect(":memory:")
+    for k in db.list_keywords(conn):
+        db.delete_keyword(conn, k["id"])
+    db.add_keyword(conn, "audio engineering degree")
+    db.add_keyword(conn, "Tontechnik Studium", region="Germany", language="German", source="suggested")
+    db.add_keyword(conn, "Tontechnik Studium", region="Austria")  # same phrase, other country is fine
+    assert not db.add_keyword(conn, "tontechnik studium", region="Germany")
+    qs = [q["query"] for q in pipeline.queries_from_db(conn, ["Germany", "UK"])]
+    assert qs == ["audio engineering degree university Germany", "Tontechnik Studium",
+                  "audio engineering degree university UK"]
+    assert len(db.list_keywords(conn, region="Germany")) == 1
+
+
+def test_prefilter_rules():
+    from scraper import config, prefilter
+    assert prefilter.rule_verdict("salford.ac.uk", {"title": "News", "url": "https://salford.ac.uk/news"}) == "yes"
+    assert prefilter.rule_verdict("thomann.de", {"title": "Best 10 audio interfaces for students", "description": ""}) == "no"
+    assert prefilter.rule_verdict("pointblankmusicschool.com",
+                                  {"title": "Music Production & Sound Engineering Diploma", "description": ""}) == "yes"
+    assert prefilter.rule_verdict("example.com", {"title": "Audio engineering in Berlin", "description": ""}) == "maybe"
+    old = config.ANTHROPIC_API_KEY
+    config.ANTHROPIC_API_KEY = ""  # no AI: uncertain results are kept, not dropped
+    try:
+        keep, skipped = prefilter.screen([
+            ("thomann.de", {"title": "Best 10 audio interfaces", "description": ""}),
+            ("example.com", {"title": "Audio engineering in Berlin", "description": ""}),
+        ])
+    finally:
+        config.ANTHROPIC_API_KEY = old
+    assert [d for d, _ in keep] == ["example.com"] and [d for d, _ in skipped] == ["thomann.de"]
+
+
+class _Req:
+    def __init__(self, value=None, error=None):
+        self.value, self.error = value, error
+
+    def execute(self):
+        if self.error:
+            raise self.error
+        return self.value
+
+
+class FakeGmail:
+    """Just enough of the Gmail API for check_gmail."""
+    def __init__(self, drafts, search_results):
+        self._drafts, self._search = drafts, search_results
+
+    def users(self):
+        return self
+
+    def drafts(self):
+        return self
+
+    def messages(self):
+        return self
+
+    def get(self, userId, id, format=None):
+        if id in self._drafts:
+            return _Req({"id": id})
+        if id.startswith("msg"):
+            return _Req({"internalDate": "1790000000000"})
+        from googleapiclient.errors import HttpError
+        resp = type("R", (), {"status": 404, "reason": "Not Found"})()
+        return _Req(error=HttpError(resp, b"not found"))
+
+    def list(self, userId, q, maxResults):
+        hits = [v for k, v in self._search.items() if k in q]
+        return _Req({"messages": hits[0]} if hits else {})
+
+
+def test_check_gmail_tracking(monkeypatch):
+    conn = db.connect(":memory:")
+    db.save_institution(conn, {"domain": "a.edu", "name": "A"}, [
+        {"name": "Still Draft", "email": "draft@a.edu"},
+        {"name": "Sent Draft", "email": "sent@a.edu"},
+    ])
+    db.save_institution(conn, {"domain": "b.edu", "name": "B"}, [
+        {"name": "Replier", "email": "r@b.edu"},
+        {"name": "Bouncer", "email": "gone@b.edu"},
+    ])
+    ids = {c["email"]: c["id"] for c in db.list_contacts(conn)}
+    db.record_outreach(conn, ids["draft@a.edu"], "draft", "d1", "s")
+    db.record_outreach(conn, ids["sent@a.edu"], "draft", "d2", "s")
+    db.record_outreach(conn, ids["r@b.edu"], "sent", "m1", "s")
+    db.record_outreach(conn, ids["gone@b.edu"], "sent", "m2", "s")
+    fake = FakeGmail(drafts={"d1"}, search_results={
+        "in:sent to:sent@a.edu": [{"id": "msg-sent"}],
+        "from:(r@b.edu": [{"id": "msg-reply"}],
+        '"gone@b.edu"': [{"id": "msg-bounce"}],
+    })
+    monkeypatch.setattr(outreach, "_service", lambda: fake)
+    changes = dict(outreach.check_gmail(conn, log=lambda m: None))
+    status = {c["email"]: c["outreach_status"] for c in db.list_contacts(conn)}
+    assert status == {"draft@a.edu": "Draft created", "sent@a.edu": "Email sent",
+                      "r@b.edu": "Replied", "gone@b.edu": "Bounced"}
+    assert ids["draft@a.edu"] not in changes
+    inst = {i["domain"]: i["status"] for i in db.list_institutions(conn)}
+    assert inst == {"a.edu": "Contacted", "b.edu": "Replied"}
+    assert db.get_contact(conn, ids["r@b.edu"])["last_reply_at"].startswith("2026")
 
 
 def test_recheck_rules():

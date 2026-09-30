@@ -7,9 +7,15 @@ from . import config
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS keywords (
-    keyword   TEXT PRIMARY KEY COLLATE NOCASE,
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword   TEXT NOT NULL COLLATE NOCASE,
+    region    TEXT NOT NULL DEFAULT '' COLLATE NOCASE,  -- '' = searched in every region
+    language  TEXT NOT NULL DEFAULT '',
+    note      TEXT NOT NULL DEFAULT '',                  -- e.g. English meaning of a local term
+    source    TEXT NOT NULL DEFAULT 'user',              -- user | suggested
     active    INTEGER NOT NULL DEFAULT 1,
-    added_at  TEXT NOT NULL
+    added_at  TEXT NOT NULL,
+    UNIQUE(keyword, region)
 );
 CREATE TABLE IF NOT EXISTS regions (
     region    TEXT PRIMARY KEY COLLATE NOCASE,
@@ -63,6 +69,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     source_url  TEXT,
     outreach_status TEXT NOT NULL DEFAULT 'Not contacted',
     last_contacted_at TEXT,
+    last_reply_at TEXT,
     synced      INTEGER NOT NULL DEFAULT 0,
     UNIQUE(domain, email, name)
 );
@@ -75,7 +82,7 @@ CREATE TABLE IF NOT EXISTS outreach (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     contact_id  INTEGER NOT NULL REFERENCES contacts(id),
     kind        TEXT NOT NULL,        -- draft | sent
-    gmail_id    TEXT,
+    gmail_id    TEXT,                 -- draft id for drafts, message id for sends
     subject     TEXT,
     created_at  TEXT NOT NULL
 );
@@ -152,28 +159,45 @@ def _seed(conn):
 
 # --- keywords & regions -------------------------------------------------------
 
-def list_keywords(conn, active_only=False):
-    sql = "SELECT * FROM keywords" + (" WHERE active = 1" if active_only else "") + " ORDER BY added_at, keyword"
-    return [dict(r) for r in conn.execute(sql)]
+def list_keywords(conn, active_only=False, region=None):
+    """region=None: all keywords. region='' : only keywords used everywhere.
+    region='Germany': only keywords specific to Germany."""
+    sql, args = "SELECT * FROM keywords WHERE 1=1", []
+    if active_only:
+        sql += " AND active = 1"
+    if region is not None:
+        sql += " AND region = ?"
+        args.append(region)
+    sql += " ORDER BY region, added_at, keyword"
+    return [dict(r) for r in conn.execute(sql, args)]
 
 
-def add_keyword(conn, keyword):
+def add_keyword(conn, keyword, region="", language="", note="", source="user"):
     keyword = keyword.strip()
     if not keyword:
         return False
-    cur = conn.execute("INSERT OR IGNORE INTO keywords (keyword, added_at) VALUES (?, ?)", (keyword, now()))
+    cur = conn.execute(
+        """INSERT OR IGNORE INTO keywords (keyword, region, language, note, source, added_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (keyword, (region or "").strip(), language, note, source, now()),
+    )
     conn.commit()
     return cur.rowcount == 1
 
 
-def set_keyword_active(conn, keyword, active):
-    conn.execute("UPDATE keywords SET active = ? WHERE keyword = ?", (int(active), keyword))
+def set_keyword_active(conn, keyword_id, active):
+    conn.execute("UPDATE keywords SET active = ? WHERE id = ?", (int(active), keyword_id))
     conn.commit()
 
 
-def delete_keyword(conn, keyword):
-    conn.execute("DELETE FROM keywords WHERE keyword = ?", (keyword,))
+def delete_keyword(conn, keyword_id):
+    conn.execute("DELETE FROM keywords WHERE id = ?", (keyword_id,))
     conn.commit()
+
+
+def find_keyword_id(conn, keyword, region=""):
+    r = conn.execute("SELECT id FROM keywords WHERE keyword = ? AND region = ?", (keyword, region)).fetchone()
+    return r["id"] if r else None
 
 
 def list_regions(conn, active_only=False):
@@ -304,6 +328,36 @@ def update_institution(conn, domain, **fields):
         return
     sets = ", ".join(f"{k} = ?" for k in fields)
     conn.execute(f"UPDATE institutions SET {sets} WHERE domain = ?", (*fields.values(), domain))
+    conn.commit()
+
+
+def pending_outreach(conn):
+    """Latest outreach record for each contact whose draft/email is still awaiting news."""
+    rows = conn.execute(
+        """SELECT c.id AS contact_id, c.email, c.domain, c.outreach_status, o.kind, o.gmail_id, o.created_at
+           FROM contacts c
+           JOIN outreach o ON o.id = (SELECT MAX(id) FROM outreach WHERE contact_id = c.id)
+           WHERE c.outreach_status IN ('Draft created', 'Email sent')"""
+    )
+    return [dict(r) for r in rows]
+
+
+def set_outreach_status(conn, contact_id, status, reply_at=None):
+    conn.execute("UPDATE contacts SET outreach_status = ? WHERE id = ?", (status, contact_id))
+    if status == "Email sent":
+        conn.execute("UPDATE contacts SET last_contacted_at = ? WHERE id = ?", (now(), contact_id))
+    if reply_at:
+        conn.execute("UPDATE contacts SET last_reply_at = ? WHERE id = ?", (reply_at, contact_id))
+    new_inst_status = {"Email sent": ("Contacted", ("New",)),
+                       "Replied": ("Replied", ("New", "Contacted"))}.get(status)
+    if new_inst_status:
+        target, from_states = new_inst_status
+        conn.execute(
+            f"""UPDATE institutions SET status = ?
+                WHERE domain = (SELECT domain FROM contacts WHERE id = ?)
+                  AND status IN ({",".join("?" * len(from_states))})""",
+            (target, contact_id, *from_states),
+        )
     conn.commit()
 
 

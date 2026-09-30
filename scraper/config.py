@@ -19,6 +19,10 @@ SCORECARD_API_KEY = _get("SCORECARD_API_KEY")
 CLAUDE_MODEL = _get("CLAUDE_MODEL", "claude-opus-5-5")
 CLAUDE_EFFORT = _get("CLAUDE_EFFORT", "low")
 
+# Cheap screening of search results before the full crawl + Claude read.
+PREFILTER = _get("PREFILTER", "on").lower() not in ("off", "0", "false", "no")
+PREFILTER_MODEL = _get("PREFILTER_MODEL", "claude-haiku-4-5")
+
 GOOGLE_SHEET_ID = _get("GOOGLE_SHEET_ID")
 GOOGLE_OAUTH_CLIENT = Path(_get("GOOGLE_OAUTH_CLIENT", str(ROOT / "credentials.json")))
 GOOGLE_TOKEN = ROOT / "token.json"

@@ -14,7 +14,7 @@ INSTITUTION_HEADERS = [
 ]
 CONTACT_HEADERS = [
     "Institution", "Website", "Name", "Title", "Role", "Email", "Phone", "Source URL",
-    "Outreach", "Last Contacted",
+    "Outreach", "Last Contacted", "Last Reply",
 ]
 STATUS_OPTIONS = ["New", "Contacted", "Replied", "Meeting set", "Partner", "Not a fit"]
 
@@ -85,6 +85,7 @@ def _contact_row(c):
     return [
         c["institution"], f"https://{c['domain']}", c["name"], c["title"], c["role"], c["email"],
         c["phone"], c["source_url"], c["outreach_status"], (c["last_contacted_at"] or "")[:10],
+        (c.get("last_reply_at") or "")[:10],
     ]
 
 
@@ -114,24 +115,30 @@ def pull_status(conn):
 
 
 def mark_outreach(contact):
-    """Update the Outreach columns for one contact row (matched by email) and bump the
-    institution's Status from New to Contacted when an email was sent."""
+    """Update the Outreach columns for one contact row (matched by email) and move the
+    institution's Status forward (New -> Contacted on send, -> Replied on a reply)."""
     sh = open_or_create()
     ws = sh.worksheet("Contacts")
     email_col = CONTACT_HEADERS.index("Email") + 1
     cells = [c for c in ws.findall(contact["email"], in_column=email_col) if c.value == contact["email"]]
     out_col = CONTACT_HEADERS.index("Outreach") + 1
     for cell in cells:
-        ws.update_cell(cell.row, out_col, contact["outreach_status"])
-        ws.update_cell(cell.row, out_col + 1, (contact["last_contacted_at"] or "")[:10])
+        ws.update(
+            [[contact["outreach_status"], (contact["last_contacted_at"] or "")[:10],
+              (contact.get("last_reply_at") or "")[:10]]],
+            gspread.utils.rowcol_to_a1(cell.row, out_col),
+        )
 
-    if contact["outreach_status"] == "Email sent":
+    moves = {"Email sent": ("Contacted", ("", "New", None)),
+             "Replied": ("Replied", ("", "New", "Contacted", None))}
+    if contact["outreach_status"] in moves:
+        target, from_states = moves[contact["outreach_status"]]
         iws = sh.worksheet("Institutions")
         site_col = INSTITUTION_HEADERS.index("Website") + 1
         status_col = INSTITUTION_HEADERS.index("Status") + 1
         for cell in iws.findall(f"https://{contact['domain']}", in_column=site_col):
-            if iws.cell(cell.row, status_col).value in ("", "New", None):
-                iws.update_cell(cell.row, status_col, "Contacted")
+            if iws.cell(cell.row, status_col).value in from_states:
+                iws.update_cell(cell.row, status_col, target)
 
 
 def sheet_url():
