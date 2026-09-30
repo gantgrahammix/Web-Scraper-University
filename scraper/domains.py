@@ -3,8 +3,9 @@ from urllib.parse import urlparse
 
 import tldextract
 
-# Offline extractor: uses the public-suffix snapshot bundled with tldextract.
-_extract = tldextract.TLDExtract(suffix_list_urls=())
+# Offline extractor using tldextract's bundled public-suffix snapshot. Private suffixes
+# (wixsite.com, github.io, ...) are included so sites hosted there aren't merged into one.
+_extract = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
 
 # Aggregators, social media, job boards, course marketplaces, etc.
 BLOCKED_DOMAINS = {

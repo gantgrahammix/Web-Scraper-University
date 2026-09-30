@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS seen_domains (
     domain    TEXT PRIMARY KEY,
     outcome   TEXT NOT NULL,          -- saved | not_relevant | error | blocked
     reason    TEXT,
+    last_url  TEXT,
+    attempts  INTEGER NOT NULL DEFAULT 1,
     seen_at   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS institutions (
@@ -207,14 +209,22 @@ def record_query(conn, query, result_count):
     conn.commit()
 
 
+def domain_status(conn, domain):
+    r = conn.execute("SELECT * FROM seen_domains WHERE domain = ?", (domain,)).fetchone()
+    return dict(r) if r else None
+
+
 def domain_seen(conn, domain):
-    return conn.execute("SELECT 1 FROM seen_domains WHERE domain = ?", (domain,)).fetchone() is not None
+    return domain_status(conn, domain) is not None
 
 
-def mark_domain_seen(conn, domain, outcome, reason=""):
+def mark_domain_seen(conn, domain, outcome, reason="", url=None):
     conn.execute(
-        "INSERT OR REPLACE INTO seen_domains (domain, outcome, reason, seen_at) VALUES (?, ?, ?, ?)",
-        (domain, outcome, reason, now()),
+        """INSERT INTO seen_domains (domain, outcome, reason, last_url, attempts, seen_at)
+           VALUES (?, ?, ?, ?, 1, ?)
+           ON CONFLICT(domain) DO UPDATE SET outcome = excluded.outcome, reason = excluded.reason,
+               last_url = excluded.last_url, attempts = attempts + 1, seen_at = excluded.seen_at""",
+        (domain, outcome, reason, url, now()),
     )
     conn.commit()
 

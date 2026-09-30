@@ -65,7 +65,9 @@ when the pages don't state it.
 accredited audio/film school. False for blogs, retailers, online-course marketplaces, directories and forums.
 - relevance: 5 = dedicated audio engineering / music production / sound design / post-production program; \
 4 = strong audio concentration inside a music, film or media program; 3 = some audio courses; \
-1-2 = only tangential; 0 = none.
+1-2 = only tangential; 0 = none. Large universities often mention the program only on its own page; \
+if the pages shown are generic but the search result clearly describes an audio program at this institution, \
+count it.
 - programs: names of the relevant programs or courses, as written on the site.
 - contacts: people or offices useful for starting a partnership conversation, best first. Roles:
   partnerships = partnerships / industry relations / corporate engagement / business development office;
@@ -78,8 +80,11 @@ accredited audio/film school. False for blogs, retailers, online-course marketpl
 with its ISO currency code and a short note (e.g. "per year, international students")."""
 
 
-def _pages_to_prompt(domain, pages):
+def _pages_to_prompt(domain, pages, hit=None):
     parts = [f"Website: {domain}\n"]
+    if hit:
+        parts.append(f"SEARCH RESULT THAT LED HERE (use as a hint only):\n{hit.get('title', '')}\n"
+                     f"{hit.get('description', '')}\n{hit.get('url', '')}\n")
     for p in pages:
         parts.append(f"=== PAGE: {p['url']}\nTITLE: {p['title']}\nEMAILS FOUND: {', '.join(p['emails']) or 'none'}\n{p['text']}\n")
     return "\n".join(parts)
@@ -89,13 +94,13 @@ class ExtractionError(RuntimeError):
     pass
 
 
-def extract_with_claude(domain, pages, client=None):
+def extract_with_claude(domain, pages, hit=None, client=None):
     client = client or anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY or None)
     response = client.beta.messages.create(
         model=config.CLAUDE_MODEL,
         max_tokens=16000,
         system=SYSTEM,
-        messages=[{"role": "user", "content": _pages_to_prompt(domain, pages)}],
+        messages=[{"role": "user", "content": _pages_to_prompt(domain, pages, hit)}],
         output_config={
             "effort": config.CLAUDE_EFFORT,
             "format": {"type": "json_schema", "schema": SCHEMA},
@@ -148,8 +153,10 @@ TITLE_ROLES = [
 ]
 
 
-def extract_with_rules(domain, pages):
+def extract_with_rules(domain, pages, hit=None):
     text = "\n".join(p["text"] for p in pages).lower()
+    if hit:
+        text += f"\n{hit.get('title', '')} {hit.get('description', '')}".lower()
     hits = [t for t in AUDIO_TERMS if t in text]
     relevance = min(5, len(hits))
     contacts = []
@@ -178,9 +185,9 @@ def extract_with_rules(domain, pages):
     }
 
 
-def extract(domain, pages):
+def extract(domain, pages, hit=None):
     if config.ANTHROPIC_API_KEY:
-        data = extract_with_claude(domain, pages)
+        data = extract_with_claude(domain, pages, hit)
     else:
-        data = extract_with_rules(domain, pages)
+        data = extract_with_rules(domain, pages, hit)
     return validate(data, pages)

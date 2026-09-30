@@ -88,7 +88,7 @@ def test_render_template():
     subject, body = outreach.render(tpl, contact)
     assert "Test University" in subject
     assert body.startswith("Dear Dr. Maria Lopez,")
-    assert "BA Audio Engineering and Music Production programs" in body
+    assert "Test University's BA Audio Engineering and Music Production and" in body
 
     _, body = outreach.render(tpl, {"name": "", "institution": "X"})
     assert body.startswith("Hello,")
@@ -97,3 +97,32 @@ def test_render_template():
 def test_build_queries():
     assert pipeline.build_queries(["foley"], ["UK", "Japan"]) == ["foley university UK", "foley university Japan"]
     assert pipeline.build_queries(["foley"], []) == ["foley university"]
+
+
+def test_recheck_rules():
+    hit_news = {"url": "https://x.ac.uk/news/1", "title": "Campus news", "description": ""}
+    hit_prog = {"url": "https://x.ac.uk/courses/audio-engineering", "title": "BSc Audio Engineering", "description": ""}
+    assert pipeline.should_process(None, hit_news)
+    assert not pipeline.should_process({"outcome": "saved", "attempts": 1, "last_url": ""}, hit_prog)
+    assert not pipeline.should_process({"outcome": "blocked", "attempts": 1, "last_url": ""}, hit_prog)
+    assert pipeline.should_process({"outcome": "error", "attempts": 2, "last_url": ""}, hit_news)
+    assert not pipeline.should_process({"outcome": "error", "attempts": 3, "last_url": ""}, hit_news)
+    rejected = {"outcome": "not_relevant", "attempts": 1, "last_url": hit_news["url"]}
+    assert not pipeline.should_process(rejected, hit_news)       # same page again
+    assert pipeline.should_process(rejected, hit_prog)           # new, audio-looking page
+    assert pipeline.audio_score(hit_prog) > pipeline.audio_score(hit_news)
+
+
+def test_attempts_counter_and_hosted_sites():
+    conn = db.connect(":memory:")
+    db.mark_domain_seen(conn, "x.edu", "error", "timeout", "https://x.edu/a")
+    db.mark_domain_seen(conn, "x.edu", "not_relevant", "r0", "https://x.edu/b")
+    st = db.domain_status(conn, "x.edu")
+    assert st["attempts"] == 2 and st["outcome"] == "not_relevant" and st["last_url"] == "https://x.edu/b"
+    assert registered_domain("https://audioschool.wixsite.com/home") != registered_domain("https://other.wixsite.com/")
+
+
+def test_program_phrase_not_doubled():
+    assert outreach._program_phrase("BSc Audio Engineering") == "BSc Audio Engineering"
+    assert outreach._program_phrase("Audio Production Program") == "Audio Production Program"
+    assert outreach._program_phrase("Sound Design") == "Sound Design program"

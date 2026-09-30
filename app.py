@@ -157,6 +157,16 @@ with tab_outreach:
             messages = []
 
         if messages:
+            picked_domains = [m[0]["domain"] for m in messages]
+            dupes = sorted({m[0]["institution"] for m in messages if picked_domains.count(m[0]["domain"]) > 1})
+            if dupes:
+                st.warning("You picked more than one contact at: " + ", ".join(dupes) +
+                           ". Schools usually respond better to one well-targeted email.")
+            already = sorted({m[0]["institution"] for m in messages
+                              if any(c["domain"] == m[0]["domain"] and c["id"] != m[0]["id"] and
+                                     c["outreach_status"] != "Not contacted" for c in db.list_contacts(conn, m[0]["domain"]))})
+            if already:
+                st.info("Someone else at these schools has already been drafted or emailed: " + ", ".join(already))
             if not is_connected():
                 st.warning("Connect your Google account (sidebar) to create drafts or send.")
             c1, c2 = st.columns(2)

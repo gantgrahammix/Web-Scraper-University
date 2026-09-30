@@ -71,7 +71,8 @@ class Crawler:
         return str(resp.url), resp.text
 
     def crawl_school(self, start_url, domain, max_pages=None):
-        """Return a list of {url, title, text, emails} for up to max_pages pages."""
+        """Return (pages, start_ok): up to max_pages {url, title, text, emails} dicts, and
+        whether the search-result page itself loaded (if not, we only saw generic pages)."""
         max_pages = max_pages or config.MAX_PAGES_PER_SCHOOL
         pages, visited, candidates = [], set(), {}
 
@@ -94,7 +95,7 @@ class Crawler:
                         candidates[link_url] = max(score, candidates.get(link_url, 0))
             return page
 
-        visit(start_url)
+        start_ok = visit(start_url) is not None
         if not pages:
             parsed = urlparse(start_url)
             visit(f"{parsed.scheme}://{parsed.netloc}/")
@@ -107,7 +108,7 @@ class Crawler:
             url = max(candidates, key=candidates.get)
             del candidates[url]
             visit(url)
-        return pages
+        return pages, start_ok
 
 
 def score_link(url, text):

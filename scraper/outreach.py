@@ -32,13 +32,19 @@ def _greeting(name, title):
     return f"Hello {parts[0]},"
 
 
+PROGRAM_WORDS = ("program", "degree", "course", "diploma", "certificate", "major", "minor",
+                 "bachelor", "master", "ba ", "bsc", "bmus", "ma ", "msc", "mfa", "hnd")
+
+
 def _program_phrase(programs):
     items = [p.strip() for p in (programs or "").split(";") if p.strip()]
     if not items:
         return "audio program"
+    named = any(w in f"{i.lower()} " for i in items[:2] for w in PROGRAM_WORDS)
     if len(items) == 1:
-        return f"{items[0]} program"
-    return f"{items[0]} and {items[1]} programs"
+        return items[0] if named else f"{items[0]} program"
+    joined = f"{items[0]} and {items[1]}"
+    return joined if named else f"{joined} programs"
 
 
 def render(template, contact):
